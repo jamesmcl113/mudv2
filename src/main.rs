@@ -1,3 +1,5 @@
+mod canvas;
+
 use std::{collections::HashMap, error::Error, net::SocketAddr, sync::Arc};
 
 use bytes::{Bytes, BytesMut};
@@ -5,6 +7,8 @@ use futures::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, Mutex};
 use tokio_util::codec::{BytesCodec, Framed, LengthDelimitedCodec};
+
+use crate::canvas::Canvas;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn Error>> {
@@ -25,13 +29,6 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-fn get_ansi_bytes(command: impl crossterm::Command) -> BytesMut {
-    let mut buf = BytesMut::new();
-    command.write_ansi(&mut buf).unwrap();
-
-    buf
-}
-
 async fn process(
     state: Arc<Mutex<Shared>>,
     stream: TcpStream,
@@ -50,7 +47,6 @@ async fn process(
     // send NAWS
     stream.send(Bytes::from_static(&[255, 253, 31])).await?;
 
-    // this assumes that the NAWS negotiation always comes last...is this correct?
     let (width, height) = match stream.next().await {
         Some(Ok(bytes)) => get_telnet_size(bytes.as_ref())?,
         _ => {
@@ -60,7 +56,20 @@ async fn process(
 
     println!("Got terminal dimensions: w = {}, h = {}", width, height);
 
+    let mut canvas = Canvas::new(width as usize, height as usize);
+
+    stream.send(Bytes::from(canvas::clear_screen())).await?;
+
     loop {
+        let mut bytes: Vec<u8> = Vec::new();
+        canvas.redraw(&mut bytes, |ctx| {
+            ctx.draw_border(0, 0, 10, 10)?;
+
+            Ok(())
+        })?;
+
+        stream.send(Bytes::from(bytes)).await?;
+
         tokio::select! {
             Some(msg) = peer.rx.recv() => {
                 stream.send(Bytes::from(msg)).await?;
@@ -78,6 +87,8 @@ async fn process(
         }
     }
 
+    stream.send(Bytes::from(canvas::restore_screen())).await?;
+
     Ok(())
 }
 
@@ -85,6 +96,7 @@ fn get_telnet_size(bytes: &[u8]) -> Result<(u16, u16), Box<dyn Error>> {
     let len = bytes.len();
 
     // get the naws negotiation
+    // this assumes that the NAWS negotiation always comes last...is this correct?
     let naws = &bytes[len - 9..];
 
     let width = (naws[3] as u16) << 8 | naws[4] as u16;
