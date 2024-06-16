@@ -9,6 +9,7 @@ edition = "2021"
 bytes = "1.5.0"
 crossterm = "0.27.0"
 futures = "0.3.30"
+ratatui = { version = "0.26.1", features = ["all-widgets"] }
 tokio = { version = "1.36.0", features = ["full"] }
 tokio-stream = "0.1.14"
 tokio-util = { version = "0.7.10", features = ["codec"] }

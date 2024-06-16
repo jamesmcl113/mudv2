@@ -1,21 +1,32 @@
+mod backend;
 mod canvas;
+mod peer;
+mod shared;
 
 use std::{collections::HashMap, error::Error, net::SocketAddr, sync::Arc};
 
-use bytes::{Bytes, BytesMut};
+use bytes::Bytes;
 use futures::{SinkExt, StreamExt};
+use ratatui::layout::Rect;
+use ratatui::Terminal;
+use shared::{PeerData, Shared};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::{mpsc, Mutex};
-use tokio_util::codec::{BytesCodec, Framed, LengthDelimitedCodec};
+use tokio::sync::Mutex;
+use tokio_util::codec::{BytesCodec, Framed};
 
+use crate::backend::TelnetBackend;
 use crate::canvas::Canvas;
+use crate::peer::Peer;
+use crate::shared::UserInput;
+
+type TelnetTerminal = Terminal<TelnetBackend>;
+
+pub type Result<T> = std::result::Result<T, Box<dyn Error>>;
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn Error>> {
+async fn main() -> Result<()> {
     let listener = TcpListener::bind("127.0.0.1:8000").await?;
-    let state = Arc::new(Mutex::new(Shared {
-        peers: HashMap::new(),
-    }));
+    let state = Arc::new(Mutex::new(Shared::new()));
 
     loop {
         let (stream, addr) = listener.accept().await?;
@@ -29,13 +40,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     }
 }
 
-async fn process(
-    state: Arc<Mutex<Shared>>,
-    stream: TcpStream,
-    addr: SocketAddr,
-) -> Result<(), Box<dyn Error>> {
+async fn process(state: Arc<Mutex<Shared>>, stream: TcpStream, addr: SocketAddr) -> Result<()> {
     let mut stream = Framed::new(stream, BytesCodec::new());
-    let mut peer = Peer::new(state, addr).await;
 
     // set no echo, character mode
     stream
@@ -56,30 +62,37 @@ async fn process(
 
     println!("Got terminal dimensions: w = {}, h = {}", width, height);
 
+    let telnet_backend = TelnetBackend::new(Rect {
+        x: 0,
+        y: 0,
+        width,
+        height,
+    });
+    let terminal = Terminal::new(telnet_backend)?;
+
+    // move these to some `ui` module
+    let clear_bytes = canvas::clear_screen()?;
+    stream.send(Bytes::from(clear_bytes)).await?;
+
+    let mut peer = Peer::new(state.clone(), addr, terminal).await;
     let mut canvas = Canvas::new(width as usize, height as usize);
 
-    stream.send(Bytes::from(canvas::clear_screen())).await?;
-
     loop {
-        let mut bytes: Vec<u8> = Vec::new();
-        canvas.redraw(&mut bytes, |ctx| {
-            ctx.draw_border(0, 0, 10, 10)?;
-
-            Ok(())
-        })?;
-
-        stream.send(Bytes::from(bytes)).await?;
-
         tokio::select! {
-            Some(msg) = peer.rx.recv() => {
-                stream.send(Bytes::from(msg)).await?;
+            Some(event) = peer.rx.recv() => {
+                let render_bytes = handle_event(event, &mut canvas);
+                stream.send(Bytes::from(render_bytes)).await.unwrap();
             }
             res = stream.next() => match res {
                 Some(Ok(msg)) => {
-                    println!("{:?}", msg);
-                    if &msg[..] == b"\x1b" {
-                        break;
+                    if let Some(event) = peer.handle_input(msg.into()).await {
+                        if matches!(event, UserInput::Quit) {
+                            break;
+                        } else {
+                            state.lock().await.move_peer(&addr, event).unwrap();
+                        }
                     }
+
                 },
                 Some(Err(e)) => {}
                 None => break,
@@ -87,12 +100,36 @@ async fn process(
         }
     }
 
-    stream.send(Bytes::from(canvas::restore_screen())).await?;
+    {
+        let mut shared = state.lock().await;
+        shared.remove_peer(addr);
+    }
+
+    let restore_bytes = canvas::restore_screen()?;
+    stream.send(Bytes::from(restore_bytes)).await?;
 
     Ok(())
 }
 
-fn get_telnet_size(bytes: &[u8]) -> Result<(u16, u16), Box<dyn Error>> {
+fn handle_event(ev: RoomEvent, canvas: &mut Canvas) -> Vec<u8> {
+    let mut buffer = Vec::new();
+    match ev {
+        RoomEvent::PeerMoved(peer_positions) => canvas
+            .redraw(&mut buffer, |ctx| {
+                ctx.clear();
+                for location in &peer_positions {
+                    ctx.set_char('@', None, location.0, location.1)?;
+                }
+
+                Ok(())
+            })
+            .unwrap(),
+    }
+
+    buffer
+}
+
+fn get_telnet_size(bytes: &[u8]) -> Result<(u16, u16)> {
     let len = bytes.len();
 
     // get the naws negotiation
@@ -105,23 +142,10 @@ fn get_telnet_size(bytes: &[u8]) -> Result<(u16, u16), Box<dyn Error>> {
     Ok((width, height))
 }
 
-type Rx = tokio::sync::mpsc::UnboundedReceiver<String>;
-type Tx = tokio::sync::mpsc::UnboundedSender<String>;
-
-struct Peer {
-    rx: Rx,
+#[derive(Clone)]
+pub enum RoomEvent {
+    PeerMoved(Vec<(usize, usize)>),
 }
 
-impl Peer {
-    async fn new(state: Arc<Mutex<Shared>>, addr: SocketAddr) -> Self {
-        let (tx, rx) = mpsc::unbounded_channel();
-
-        state.lock().await.peers.insert(addr, tx);
-
-        Peer { rx }
-    }
-}
-
-struct Shared {
-    peers: HashMap<SocketAddr, Tx>,
-}
+pub type Rx = tokio::sync::mpsc::UnboundedReceiver<RoomEvent>;
+pub type Tx = tokio::sync::mpsc::UnboundedSender<RoomEvent>;

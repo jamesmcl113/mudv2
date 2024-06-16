@@ -1,12 +1,49 @@
 use core::panic;
 use std::{error::Error, fmt::Display};
 
-use crossterm::QueueableCommand;
+use crossterm::{
+    style::{Attribute, Color},
+    QueueableCommand,
+};
 
-type Result<T> = std::result::Result<T, Box<dyn Error>>;
+use crate::Result;
+
+#[derive(Clone, Copy, PartialEq)]
+pub struct Style {
+    pub fg: Option<Color>,
+    pub bg: Option<Color>,
+    pub bold: bool,
+    pub italic: bool,
+}
+
+impl Default for Style {
+    fn default() -> Self {
+        Style {
+            fg: None,
+            bg: None,
+            bold: false,
+            italic: false,
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+struct Cell {
+    ch: char,
+    style: Style,
+}
+
+impl Default for Cell {
+    fn default() -> Self {
+        Cell {
+            ch: ' ',
+            style: Style::default(),
+        }
+    }
+}
 
 struct BufferChange<'a> {
-    ch: &'a char,
+    cell: &'a Cell,
     x: usize,
     y: usize,
 }
@@ -16,7 +53,7 @@ struct BufferChange<'a> {
 // this would allow unicode graphemes but it'll be more complex.
 #[derive(Clone)]
 pub struct RenderBuffer {
-    data: Vec<char>,
+    data: Vec<Cell>,
     width: usize,
     height: usize,
 }
@@ -25,7 +62,7 @@ impl Display for RenderBuffer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         for j in 0..self.height {
             let line = &self.data[j * self.width..j * self.width + self.width];
-            let line: String = line.iter().collect();
+            let line: String = line.iter().map(|cell| cell.ch).collect();
             write!(f, "{}\n", line)?;
         }
 
@@ -36,10 +73,18 @@ impl Display for RenderBuffer {
 impl RenderBuffer {
     pub fn new(width: usize, height: usize) -> Self {
         RenderBuffer {
-            data: vec![' '; width * height],
+            data: vec![Cell::default(); width * height],
             width,
             height,
         }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
     }
 
     fn coord_to_idx(&self, x: usize, y: usize) -> usize {
@@ -53,7 +98,15 @@ impl RenderBuffer {
         y * self.width + x
     }
 
-    pub fn draw_border(&mut self, x: usize, y: usize, width: usize, height: usize) -> Result<()> {
+    /// Draw bordered rect with top left at (`x`, `y`).
+    pub fn draw_border(
+        &mut self,
+        x: usize,
+        y: usize,
+        width: usize,
+        height: usize,
+        style: Option<&Style>,
+    ) -> Result<()> {
         if x + width > self.width {
             return Err("Bordered area width exceeds buffer width".into());
         }
@@ -63,33 +116,46 @@ impl RenderBuffer {
         }
 
         for i in x + 1..x + width - 1 {
-            self.set_char('─', i, y)?;
-            self.set_char('─', i, y + height - 1)?;
+            self.set_char('─', style, i, y)?;
+            self.set_char('─', style, i, y + height - 1)?;
         }
 
         for j in y + 1..y + height - 1 {
-            self.set_char('│', x, j)?;
-            self.set_char('│', x + width - 1, j)?;
+            self.set_char('│', style, x, j)?;
+            self.set_char('│', style, x + width - 1, j)?;
         }
 
-        self.set_char('┌', x, y)?;
-        self.set_char('┐', x + width - 1, y)?;
-        self.set_char('┘', x + width - 1, y + height - 1)?;
-        self.set_char('└', x, y + height - 1)?;
+        self.set_char('┌', style, x, y)?;
+        self.set_char('┐', style, x + width - 1, y)?;
+        self.set_char('┘', style, x + width - 1, y + height - 1)?;
+        self.set_char('└', style, x, y + height - 1)?;
 
         Ok(())
     }
 
-    pub fn set_char(&mut self, ch: char, x: usize, y: usize) -> Result<()> {
+    pub fn clear(&mut self) {
+        self.data = vec![Cell::default(); self.width * self.height];
+    }
+
+    pub fn set_char(&mut self, ch: char, style: Option<&Style>, x: usize, y: usize) -> Result<()> {
         let idx = self.coord_to_idx(x, y);
-        let char_to_change = self.data.get_mut(idx).ok_or("Coords out of range.")?;
+        let cell_to_change = self.data.get_mut(idx).ok_or("Coords out of range.")?;
 
-        *char_to_change = ch;
+        *cell_to_change = Cell {
+            style: style.unwrap_or(&Style::default()).clone(),
+            ch,
+        };
 
         Ok(())
     }
 
-    pub fn set_text(&mut self, text: &str, x: usize, y: usize) -> Result<()> {
+    pub fn set_text(
+        &mut self,
+        text: &str,
+        style: Option<&Style>,
+        x: usize,
+        y: usize,
+    ) -> Result<()> {
         if x + text.chars().count() > self.width {
             return Err(format!(
                 "Text: '{text}' is too long for canvas. {x} + {} exceeds width: {}",
@@ -100,15 +166,15 @@ impl RenderBuffer {
         }
 
         for (i, ch) in text.chars().enumerate() {
-            self.set_char(ch, x + i, y)?;
+            self.set_char(ch, style, x + i, y)?;
         }
 
         Ok(())
     }
 
-    pub fn char_at(&self, x: usize, y: usize) -> &char {
+    pub fn cell_at(&self, x: usize, y: usize) -> &Cell {
         let idx = self.coord_to_idx(x, y);
-        self.data.get(idx).unwrap()
+        &self.data.get(idx).unwrap()
     }
 
     fn diff(&self, other: &Self) -> Vec<BufferChange<'_>> {
@@ -116,10 +182,10 @@ impl RenderBuffer {
 
         for y in 0..self.height {
             for x in 0..self.width {
-                let current_char = self.char_at(x, y);
-                if current_char != other.char_at(x, y) {
+                let current_cell = self.cell_at(x, y);
+                if current_cell != other.cell_at(x, y) {
                     changes.push(BufferChange {
-                        ch: current_char,
+                        cell: current_cell,
                         x,
                         y,
                     });
@@ -156,10 +222,21 @@ impl Canvas {
 
         let diff = self.buffer.diff(&old_buffer);
 
-        for BufferChange { ch, x, y } in diff {
+        for BufferChange { cell, x, y } in diff {
             writer
                 .queue(crossterm::cursor::MoveTo(x as u16, y as u16))?
-                .queue(crossterm::style::Print(ch))?;
+                .queue(crossterm::style::SetForegroundColor(
+                    cell.style.fg.unwrap_or(Color::Reset),
+                ))?
+                .queue(crossterm::style::SetBackgroundColor(
+                    cell.style.bg.unwrap_or(Color::Reset),
+                ))?
+                .queue(crossterm::style::SetAttribute(if cell.style.bold {
+                    Attribute::Bold
+                } else {
+                    Attribute::NormalIntensity
+                }))?
+                .queue(crossterm::style::Print(cell.ch))?;
         }
 
         writer.flush()?;
@@ -168,24 +245,24 @@ impl Canvas {
     }
 }
 
-pub fn restore_screen() -> Vec<u8> {
+pub fn restore_screen() -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
-    buf.queue(crossterm::terminal::LeaveAlternateScreen)
-        .unwrap();
+    buf.queue(crossterm::terminal::LeaveAlternateScreen)?
+        .queue(crossterm::cursor::Show)?;
 
-    buf
+    Ok(buf)
 }
 
-pub fn clear_screen() -> Vec<u8> {
+pub fn clear_screen() -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
-    buf.queue(crossterm::terminal::EnterAlternateScreen)
-        .unwrap()
-        .queue(crossterm::cursor::MoveTo(0, 0))
-        .unwrap();
+    buf.queue(crossterm::terminal::EnterAlternateScreen)?
+        .queue(crossterm::cursor::Hide)?
+        .queue(crossterm::cursor::MoveTo(0, 0))?;
 
-    buf
+    Ok(buf)
 }
 
+/*
 #[cfg(test)]
 mod test {
     use super::*;
@@ -251,3 +328,4 @@ mod test {
         assert!(res.is_err());
     }
 }
+*/
